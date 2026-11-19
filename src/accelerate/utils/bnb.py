@@ -210,10 +210,12 @@ def get_quantized_model_device_map(
         logger.info("The device_map was not initialized.Setting device_map to `{'':torch.cuda.current_device()}`.")
 
     if isinstance(device_map, str):
-        if device_map not in ["auto", "balanced", "balanced_low_0", "sequential"]:
+        device_map = device_map.lower().replace("-", "_")
+        memory_aware_names = {"memory_aware", "memory_balanced", "balanced_layer", "layer_balanced"}
+        if device_map not in ["auto", "balanced", "balanced_low_0", "sequential", *memory_aware_names]:
             raise ValueError(
                 "If passing a string for `device_map`, please choose 'auto', 'balanced', 'balanced_low_0' or "
-                "'sequential'."
+                "'sequential', or 'memory_aware'."
             )
 
         special_dtypes = {}
@@ -238,7 +240,9 @@ def get_quantized_model_device_map(
         kwargs["dtype"] = bnb_quantization_config.target_dtype
 
         # get max_memory for each device.
-        if device_map != "sequential":
+        if device_map in memory_aware_names:
+            kwargs["strategy"] = "memory_aware"
+        elif device_map != "sequential":
             max_memory = get_balanced_memory(
                 model,
                 low_zero=(device_map == "balanced_low_0"),

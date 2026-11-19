@@ -38,6 +38,7 @@ from .utils import (
     extract_submodules_state_dict,
     find_tied_parameters,
     get_balanced_memory,
+    get_device_map_report,
     get_torch_accelerator_backend,
     infer_auto_device_map,
     is_bnb_available,
@@ -513,6 +514,7 @@ def load_checkpoint_and_dispatch(
     strict: bool = False,
     full_state_dict: bool = True,
     broadcast_from_rank0: bool = False,
+    report_device_map: bool = False,
 ):
     """
     Loads a (potentially sharded) checkpoint inside a model, potentially sending weights to a given device as they are
@@ -531,6 +533,7 @@ def load_checkpoint_and_dispatch(
 
             To have Accelerate compute the most optimized `device_map` automatically, set `device_map="auto"`. For more
             information about each option see [here](../concept_guides/big_model_inference#designing-a-device-map).
+            Use `device_map="memory_aware"` to balance GPUs using their available memory and the size of each layer.
             Defaults to None, which means [`dispatch_model`] will not be called.
         max_memory (`Dict`, *optional*):
             A dictionary device identifier to maximum memory. Will default to the maximum memory available for each GPU
@@ -568,6 +571,9 @@ def load_checkpoint_and_dispatch(
             `ProcessGroup` must be initialized. rank0 should receive a full state_dict and will broadcast the tensors
             in the state_dict one by one to other ranks. Other ranks will receive the tensors and shard (if applicable)
             according to the local shards in the model.
+        report_device_map (`bool`, *optional*, defaults to `False`):
+            Attach a [`DeviceMapReport`] to the returned model as `model.hf_device_map_report`. Reports are always
+            attached when `device_map="memory_aware"`.
 
     Example:
 
@@ -591,12 +597,29 @@ def load_checkpoint_and_dispatch(
     ... )
     ```
     """
-    if isinstance(device_map, str) and device_map not in ["auto", "balanced", "balanced_low_0", "sequential"]:
-        raise ValueError(
-            "If passing a string for `device_map`, please choose 'auto', 'balanced', 'balanced_low_0' or 'sequential'."
-        )
+    memory_aware_names = {"memory_aware", "memory_balanced", "balanced_layer", "layer_balanced"}
+    supported_device_map_strategies = ["auto", "balanced", "balanced_low_0", "sequential", *memory_aware_names]
+    device_map_strategy = device_map if isinstance(device_map, str) else "custom"
     if isinstance(device_map, str):
-        if device_map != "sequential":
+        device_map = device_map.lower().replace("-", "_")
+        if device_map not in supported_device_map_strategies:
+            raise ValueError(
+                "If passing a string for `device_map`, please choose 'auto', 'balanced', 'balanced_low_0', "
+                "'sequential' or 'memory_aware'."
+            )
+    device_map_report = None
+    if isinstance(device_map, str):
+        if device_map in memory_aware_names:
+            device_map, device_map_report = infer_auto_device_map(
+                model,
+                max_memory=max_memory,
+                no_split_module_classes=no_split_module_classes,
+                dtype=dtype,
+                offload_buffers=offload_buffers,
+                strategy="memory_aware",
+                return_report=True,
+            )
+        elif device_map != "sequential":
             max_memory = get_balanced_memory(
                 model,
                 max_memory=max_memory,
@@ -604,12 +627,28 @@ def load_checkpoint_and_dispatch(
                 dtype=dtype,
                 low_zero=(device_map == "balanced_low_0"),
             )
-        device_map = infer_auto_device_map(
+            device_map = infer_auto_device_map(
+                model,
+                max_memory=max_memory,
+                no_split_module_classes=no_split_module_classes,
+                dtype=dtype,
+                offload_buffers=offload_buffers,
+            )
+        else:
+            device_map = infer_auto_device_map(
+                model,
+                max_memory=max_memory,
+                no_split_module_classes=no_split_module_classes,
+                dtype=dtype,
+                offload_buffers=offload_buffers,
+            )
+    if report_device_map and device_map_report is None and device_map is not None:
+        device_map_report = get_device_map_report(
             model,
+            device_map,
             max_memory=max_memory,
-            no_split_module_classes=no_split_module_classes,
             dtype=dtype,
-            offload_buffers=offload_buffers,
+            strategy=device_map_strategy,
         )
     if offload_state_dict is None and device_map is not None and "disk" in device_map.values():
         offload_state_dict = True
@@ -627,7 +666,7 @@ def load_checkpoint_and_dispatch(
     )
     if device_map is None:
         return model
-    return dispatch_model(
+    model = dispatch_model(
         model,
         device_map=device_map,
         offload_dir=offload_folder,
@@ -636,6 +675,9 @@ def load_checkpoint_and_dispatch(
         preload_module_classes=preload_module_classes,
         force_hooks=force_hooks,
     )
+    if device_map_report is not None:
+        model.hf_device_map_report = device_map_report
+    return model
 
 
 def attach_layerwise_casting_hooks(

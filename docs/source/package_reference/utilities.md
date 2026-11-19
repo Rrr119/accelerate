@@ -188,9 +188,17 @@ These utilities relate to interacting with PyTorch models
 
 [[autodoc]] utils.get_balanced_memory
 
+[[autodoc]] utils.DeviceMapReport
+
+[[autodoc]] utils.get_device_map_report
+
 [[autodoc]] utils.get_max_layer_size
 
 [[autodoc]] utils.infer_auto_device_map
+
+[[autodoc]] utils.infer_device_map
+
+[[autodoc]] utils.infer_memory_aware_device_map
 
 [[autodoc]] utils.load_checkpoint_in_model
 

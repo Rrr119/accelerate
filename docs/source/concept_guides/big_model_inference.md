@@ -225,7 +225,7 @@ This way, your model can run for inference even if it doesn't fit on one of the 
 
 ### Designing a device map
 
-You can let Accelerate handle the device map computation by setting `device_map` to one of the supported options (`"auto"`, `"balanced"`, `"balanced_low_0"`, `"sequential"`) or create one yourself if you want more control over where each layer should go.
+You can let Accelerate handle the device map computation by setting `device_map` to one of the supported options (`"auto"`, `"balanced"`, `"balanced_low_0"`, `"sequential"`, `"memory_aware"`) or create one yourself if you want more control over where each layer should go.
 
 <Tip>
 
@@ -239,6 +239,7 @@ When you have more GPU memory available than the model size, here is the differe
 - `"auto"` and `"balanced"` evenly split the model on all available GPUs, making it possible for you to use a batch size greater than 1.
 - `"balanced_low_0"` evenly splits the model on all GPUs except the first one, and only puts on GPU 0 what does not fit on the others. This option is great when you need to use GPU 0 for some processing of the outputs, like when using the `generate` function for Transformers models
 - `"sequential"` will fit what it can on GPU 0, then move on GPU 1 and so forth (so won't use the last GPUs if it doesn't need to).
+- `"memory_aware"` targets memory usage proportional to each GPU's capacity. It accounts for both the available memory reported for each device and the actual size of each layer, which is useful with heterogeneous GPUs. Layers that fit on no GPU are offloaded to CPU and then disk (controlled by the `offload` argument).
 
 <Tip>
 
@@ -255,6 +256,22 @@ from accelerate import infer_auto_device_map
 
 device_map = infer_auto_device_map(my_model, max_memory={0: "10GiB", 1: "10GiB", "cpu": "30GiB"})
 ```
+
+For a memory-aware map with an allocation report:
+
+```python
+from accelerate import infer_device_map
+
+device_map, report = infer_device_map(
+    my_model,
+    max_memory={0: "10GiB", 1: "20GiB", "cpu": "30GiB"},
+    offload=["cpu", "disk"],
+    return_report=True,
+)
+print(report)
+```
+
+`report.device_usage` contains the capacity, used and free memory for every device, along with the modules assigned to it. The same report can be generated for an existing map with `get_device_map_report`.
 
 <Tip warning={true}>
 

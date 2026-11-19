@@ -22,6 +22,7 @@ import shutil
 import tempfile
 import warnings
 from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
@@ -1218,9 +1219,12 @@ def fallback_allocate(
             if any(name + "." in k + "." for k in tied_group) and not all(name + "." in k + "." for k in tied_group)
         ]
 
-        tied_params = sum(
-            [[p for p in tied_group if name + "." not in p + "."] for tied_group in tied_param_groups], []
-        )
+        tied_params = [
+            parameter
+            for tied_group in tied_param_groups
+            for parameter in tied_group
+            if name + "." not in parameter + "."
+        ]
 
         module_size_with_ties, _, _ = get_module_size_with_ties(
             tied_params, module_sizes[name], module_sizes, modules_to_search
@@ -1275,6 +1279,484 @@ def fallback_allocate(
     return name, module, modules
 
 
+@dataclass
+class DeviceMapReport:
+    """
+    A structured report describing how a model was allocated across devices.
+
+    Attributes:
+        strategy (`str`):
+            The allocation strategy used to create the device map.
+        device_map (`Dict[str, Union[int, str, torch.device]]`):
+            The resulting device map.
+        device_usage (`Dict[Union[int, str], Dict]`):
+            Per-device usage information. Each entry contains the memory capacity (when known), the number of bytes
+            allocated, the remaining memory and the modules assigned to the device.
+        total_size (`int`):
+            The total size of the model tensors.
+        offloaded_size (`int`):
+            The number of bytes assigned to CPU or disk offload.
+        allocations (`List[Dict]`):
+            One entry per device-map entry with its module name, device and size.
+    """
+
+    strategy: str
+    device_map: dict[str, Union[int, str, torch.device]]
+    device_usage: dict[Union[int, str], dict]
+    total_size: int
+    offloaded_size: int
+    allocations: list[dict]
+
+    def to_dict(self) -> dict:
+        return {
+            "strategy": self.strategy,
+            "device_map": dict(self.device_map),
+            "device_usage": self.device_usage,
+            "total_size": self.total_size,
+            "offloaded_size": self.offloaded_size,
+            "allocations": self.allocations,
+        }
+
+    @property
+    def devices(self) -> dict[Union[int, str], dict]:
+        """Alias for `device_usage`."""
+        return self.device_usage
+
+    def as_dict(self) -> dict:
+        """Return the report as a serializable dictionary."""
+        return self.to_dict()
+
+    def as_text(self) -> str:
+        """Return a human-readable table describing the allocation."""
+        return self.format()
+
+    def format(self) -> str:
+        lines = [
+            "Device map allocation report",
+            f"Strategy: {self.strategy}",
+            f"Total model size: {_format_size(self.total_size)}",
+            f"Offloaded size: {_format_size(self.offloaded_size)}",
+            "",
+            f"{'Device':<12}{'Capacity':>14}{'Used':>14}{'Free':>14}{'Utilization':>14}  Modules",
+        ]
+        for device, usage in self.device_usage.items():
+            capacity = usage["capacity"]
+            free = usage["free"]
+            utilization = usage["utilization"]
+            modules = ", ".join(usage["modules"])
+            if len(modules) > 80:
+                modules = f"{modules[:77]}..."
+            lines.append(
+                f"{device!s:<12}"
+                f"{_format_size(capacity) if capacity is not None else 'unknown':>14}"
+                f"{_format_size(usage['used']):>14}"
+                f"{_format_size(free) if free is not None else 'unknown':>14}"
+                f"{f'{utilization:.1%}' if utilization is not None else 'n/a':>14}  {modules}"
+            )
+        return "\n".join(lines)
+
+    def __str__(self):
+        return self.format()
+
+    def __getitem__(self, key):
+        return self.to_dict()[key]
+
+    def __iter__(self):
+        return iter(self.to_dict())
+
+    def __len__(self):
+        return len(self.to_dict())
+
+    def keys(self):
+        return self.to_dict().keys()
+
+    def items(self):
+        return self.to_dict().items()
+
+    def get(self, key, default=None):
+        return self.to_dict().get(key, default)
+
+
+def _format_size(size: Optional[int]) -> str:
+    if size is None:
+        return "unknown"
+    if size < 0:
+        return f"-{_format_size(-size)}"
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+
+
+def _get_tensor_size(
+    name: str,
+    tensor: torch.Tensor,
+    dtype: Optional[Union[str, torch.dtype]],
+    special_dtypes: Optional[dict[str, Union[str, torch.dtype]]],
+) -> int:
+    if special_dtypes is not None and name in special_dtypes:
+        return tensor.numel() * dtype_byte_size(_get_proper_dtype(special_dtypes[name]))
+    if dtype is None:
+        return tensor.numel() * dtype_byte_size(tensor.dtype)
+    dtype = _get_proper_dtype(dtype)
+    if str(tensor.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
+        return tensor.numel() * dtype_byte_size(tensor.dtype)
+    return tensor.numel() * min(dtype_byte_size(dtype), dtype_byte_size(tensor.dtype))
+
+
+def _get_tensor_device(name: str, device_map: dict[str, Union[int, str, torch.device]]):
+    if name in device_map:
+        return device_map[name]
+    prefix = name
+    while "." in prefix:
+        prefix = prefix.rsplit(".", 1)[0]
+        if prefix in device_map:
+            return device_map[prefix]
+    if "" in device_map:
+        return device_map[""]
+    raise ValueError(f"The device map does not cover the tensor {name}.")
+
+
+def get_device_map_report(
+    model: nn.Module,
+    device_map: dict[str, Union[int, str, torch.device]],
+    max_memory: Optional[dict[Union[int, str], Union[int, str]]] = None,
+    dtype: Optional[Union[str, torch.dtype]] = None,
+    special_dtypes: Optional[dict[str, Union[str, torch.dtype]]] = None,
+    strategy: str = "custom",
+) -> DeviceMapReport:
+    """
+    Build a report for an existing device map.
+
+    Args:
+        model (`torch.nn.Module`):
+            The model that `device_map` describes.
+        device_map (`Dict[str, Union[int, str, torch.device]]`):
+            The device map to inspect.
+        max_memory (`Dict`, *optional*):
+            Device capacities used for the report. When omitted, capacities are inferred with [`get_max_memory`].
+        dtype (`str` or `torch.dtype`, *optional*):
+            If provided, sizes are computed as if the weights were loaded in this dtype.
+        special_dtypes (`Dict[str, Union[str, torch.dtype]]`, *optional*):
+            Per-parameter dtype overrides.
+        strategy (`str`, *optional*, defaults to `"custom"`):
+            Name of the strategy that produced the device map.
+
+    Returns:
+        [`DeviceMapReport`]: A report containing per-device capacity, usage and assigned modules.
+    """
+    if max_memory is None:
+        max_memory = get_max_memory()
+    else:
+        max_memory = {
+            device: convert_file_size_to_int(capacity) if isinstance(capacity, str) else capacity
+            for device, capacity in max_memory.items()
+        }
+    usage = defaultdict(int)
+    for name, tensor in named_module_tensors(model, recurse=True):
+        device = _get_tensor_device(name, device_map)
+        usage[device] += _get_tensor_size(name, tensor, dtype, special_dtypes)
+
+    total_size = sum(usage.values())
+    modules_by_device = defaultdict(list)
+    for module_name, device in device_map.items():
+        modules_by_device[device].append(module_name or "<root>")
+
+    module_sizes = compute_module_sizes(model, dtype=dtype, special_dtypes=special_dtypes)
+    allocations = [
+        {
+            "module": module_name,
+            "device": device,
+            "size": module_sizes.get(module_name, 0),
+            "offloaded": device in ("cpu", "disk"),
+        }
+        for module_name, device in device_map.items()
+    ]
+
+    all_devices = list(max_memory.keys())
+    for device in usage:
+        if device not in all_devices:
+            all_devices.append(device)
+
+    device_usage = {}
+    for device in all_devices:
+        used = usage.get(device, 0)
+        capacity = max_memory.get(device)
+        free = capacity - used if capacity is not None else None
+        device_usage[device] = {
+            "capacity": capacity,
+            "used": used,
+            "free": free,
+            "utilization": used / capacity if capacity else None,
+            "modules": modules_by_device.get(device, []),
+        }
+
+    offloaded_size = usage.get("cpu", 0) + usage.get("disk", 0)
+    return DeviceMapReport(
+        strategy=strategy,
+        device_map=device_map,
+        device_usage=device_usage,
+        total_size=total_size,
+        offloaded_size=offloaded_size,
+        allocations=allocations,
+    )
+
+
+def _normalize_allocation_strategy(strategy: str) -> str:
+    strategy = strategy.lower().replace("-", "_")
+    aliases = {
+        "sequential": "sequential",
+        "auto": "sequential",
+        "memory_aware": "memory_aware",
+        "memory_balanced": "memory_aware",
+        "balanced_layer": "memory_aware",
+        "layer_balanced": "memory_aware",
+        "balanced": "memory_aware",
+    }
+    if strategy not in aliases:
+        raise ValueError(
+            f"Unknown allocation strategy {strategy!r}. Choose from 'sequential', 'memory_aware' "
+            "('memory_balanced', 'balanced_layer' and 'balanced' are aliases)."
+        )
+    return aliases[strategy]
+
+
+def _get_offload_devices(
+    offload: Union[bool, str, list[str], tuple[str, ...], None],
+    max_memory: dict[Union[int, str], Optional[int]],
+) -> list[str]:
+    if offload is None or offload is False:
+        return []
+    if offload is True:
+        offload = ["cpu", "disk"]
+    if isinstance(offload, str):
+        offload = offload.lower()
+        if offload == "none":
+            return []
+        if offload == "auto":
+            devices = ["cpu"] if "cpu" in max_memory else []
+            devices.append("disk")
+            return devices
+        offload = [offload]
+    if not isinstance(offload, (list, tuple)):
+        raise ValueError("`offload` must be a boolean, 'auto', 'cpu', 'disk', 'none', or a list of devices.")
+
+    devices = []
+    for device in offload:
+        device = str(device).lower()
+        if device not in ("cpu", "disk"):
+            raise ValueError(f"Unsupported offload device {device!r}. Only 'cpu' and 'disk' are supported.")
+        if device not in devices:
+            devices.append(device)
+    if "cpu" in devices and "cpu" not in max_memory:
+        import psutil
+
+        max_memory["cpu"] = psutil.virtual_memory().available
+    if "disk" in devices and "disk" not in max_memory:
+        max_memory["disk"] = None
+    return devices
+
+
+def _split_allocation_unit(
+    name: str, module: nn.Module, no_split_module_classes: list[str]
+) -> Optional[list[tuple[str, nn.Module]]]:
+    if isinstance(module, (nn.Parameter, torch.Tensor)):
+        return None
+    if module.__class__.__name__ in no_split_module_classes:
+        return None
+    children = list(module.named_children())
+    if len(children) == 0:
+        return None
+    children = list(module.named_parameters(recurse=False)) + children + list(module.named_buffers(recurse=False))
+    return [(f"{name}.{child_name}", child) for child_name, child in children]
+
+
+def _infer_memory_aware_device_map(
+    model: nn.Module,
+    max_memory: Optional[dict[Union[int, str], Union[int, str]]] = None,
+    no_split_module_classes: Optional[list[str]] = None,
+    dtype: Optional[Union[str, torch.dtype]] = None,
+    special_dtypes: Optional[dict[str, Union[str, torch.device]]] = None,
+    clean_result: bool = True,
+    offload: Union[bool, str, list[str], tuple[str, ...], None] = "auto",
+    verbose: bool = False,
+    offload_buffers: bool = False,
+) -> tuple[dict[str, Union[int, str]], DeviceMapReport]:
+    (
+        devices,
+        max_memory,
+        _,
+        gpus,
+        module_sizes,
+        tied_parameters,
+        no_split_module_classes,
+        modules_to_treat,
+    ) = _init_infer_auto_device_map(model, max_memory, no_split_module_classes, dtype, special_dtypes)
+
+    max_memory = dict(max_memory)
+    offload_devices = _get_offload_devices(offload, max_memory)
+    for device in offload_devices:
+        if device not in devices:
+            devices.append(device)
+
+    pending = list(modules_to_treat)
+    device_memory_used = defaultdict(int)
+    device_map = OrderedDict()
+    total_model_size = module_sizes[""]
+    total_gpu_capacity = sum(max_memory[device] for device in gpus if max_memory.get(device) is not None)
+    fill_gpus = total_model_size >= total_gpu_capacity
+
+    while pending:
+        name, module = pending.pop(0)
+        if verbose:
+            print(f"\nTreating module {name} (size={module_sizes[name]}).")
+        tied_param_groups = [
+            tied_group
+            for tied_group in tied_parameters
+            if any(name + "." in k + "." for k in tied_group) and not all(name + "." in k + "." for k in tied_group)
+        ]
+        tied_params = sum(
+            [[p for p in tied_group if name + "." not in p + "."] for tied_group in tied_param_groups], []
+        )
+        module_size, tied_module_names, _ = get_module_size_with_ties(
+            tied_params, module_sizes[name], module_sizes, pending
+        )
+
+        group_names = [name]
+        for tied_module_name in tied_module_names:
+            if tied_module_name not in group_names:
+                group_names.append(tied_module_name)
+
+        pending_by_name = dict(pending)
+        group = [(name, module)]
+        group.extend(
+            (group_name, pending_by_name[group_name])
+            for group_name in group_names[1:]
+            if group_name in pending_by_name
+        )
+
+        def choose_gpu(size: int):
+            candidates = []
+            for device_index, device in enumerate(gpus):
+                capacity = max_memory.get(device)
+                if capacity is None or device_memory_used[device] + size > capacity:
+                    continue
+                used_after = device_memory_used[device] + size
+                target = capacity if fill_gpus else total_model_size * capacity / total_gpu_capacity
+                projected_deviation = 0
+                projected_relative_deviation = 0
+                for other_device in gpus:
+                    other_capacity = max_memory.get(other_device)
+                    if other_capacity is None:
+                        continue
+                    other_used = used_after if other_device == device else device_memory_used[other_device]
+                    other_target = (
+                        other_capacity if fill_gpus else total_model_size * other_capacity / total_gpu_capacity
+                    )
+                    projected_deviation += abs(other_used - other_target)
+                    projected_relative_deviation += ((other_used - other_target) / max(other_target, 1)) ** 2
+                utilization = used_after / capacity
+                current_utilization = device_memory_used[device] / capacity
+                candidates.append(
+                    (
+                        projected_relative_deviation,
+                        projected_deviation,
+                        abs(used_after - target),
+                        -(capacity - used_after),
+                        current_utilization,
+                        utilization,
+                        device_index,
+                        device,
+                    )
+                )
+            return min(candidates)[-1] if len(candidates) > 0 else None
+
+        target_device = choose_gpu(module_size)
+        if target_device is None:
+            # First try to split the current module, then any module tied to it. This preserves tied parameters on
+            # the same device while still allowing a large parent module to be distributed at layer granularity.
+            split_modules = None
+            if name == group_names[0]:
+                split_modules = _split_allocation_unit(name, module, no_split_module_classes)
+            if split_modules is not None:
+                if verbose:
+                    print(f"Splitting {name}.")
+                pending = split_modules + pending
+                continue
+
+            split_happened = False
+            for tied_module_name in group_names[1:]:
+                tied_module = pending_by_name.get(tied_module_name)
+                if tied_module is None:
+                    continue
+                split_modules = _split_allocation_unit(tied_module_name, tied_module, no_split_module_classes)
+                if split_modules is None:
+                    continue
+                if verbose:
+                    print(f"Splitting tied module {tied_module_name}.")
+                tied_module_index = next(i for i, (n, _) in enumerate(pending) if n == tied_module_name)
+                pending = (
+                    [(name, module)] + pending[:tied_module_index] + split_modules + pending[tied_module_index + 1 :]
+                )
+                split_happened = True
+                break
+            if split_happened:
+                continue
+
+            for offload_device in offload_devices:
+                capacity = max_memory.get(offload_device)
+                if capacity is None or device_memory_used[offload_device] + module_size <= capacity:
+                    target_device = offload_device
+                    break
+            if target_device is None:
+                capacities = ", ".join(
+                    f"{device}={capacity}" for device, capacity in max_memory.items() if device not in ("cpu", "disk")
+                )
+                raise ValueError(
+                    f"Unable to allocate module {name!r} (size={module_size} bytes). The available GPU capacities "
+                    f"are {capacities or 'none'} and the allowed offload devices {offload_devices or 'none'} "
+                    "do not have enough memory. Increase `max_memory` or enable CPU/disk offload."
+                )
+
+        if verbose:
+            print(f"Putting {group_names} (size={module_size}) on {target_device}.")
+        for group_name, _ in group:
+            device_map[group_name] = target_device
+            if group_name != name:
+                pending = [(n, m) for n, m in pending if n != group_name]
+        device_memory_used[target_device] += module_size
+
+    if clean_result:
+        device_map = clean_device_map(device_map)
+
+    if gpus and not offload_buffers:
+        non_gpu_buffer_size = sum(
+            _get_tensor_size(name, buffer, dtype, special_dtypes)
+            for name, buffer in model.named_buffers(recurse=True)
+            if _get_tensor_device(name, device_map) in ("cpu", "disk")
+        )
+        if non_gpu_buffer_size > 0 and not any(
+            max_memory[device] - device_memory_used[device] >= non_gpu_buffer_size for device in gpus
+        ):
+            warnings.warn(
+                f"Current model requires {non_gpu_buffer_size} bytes of buffer for offloaded layers, which seems does "
+                f"not fit any GPU's remaining memory. If you are experiencing a OOM later, please consider using "
+                f"offload_buffers=True."
+            )
+
+    report = get_device_map_report(
+        model,
+        device_map,
+        max_memory=max_memory,
+        dtype=dtype,
+        special_dtypes=special_dtypes,
+        strategy="memory_aware",
+    )
+    return device_map, report
+
+
 def infer_auto_device_map(
     model: nn.Module,
     max_memory: Optional[dict[Union[int, str], Union[int, str]]] = None,
@@ -1285,6 +1767,9 @@ def infer_auto_device_map(
     clean_result: bool = True,
     offload_buffers: bool = False,
     fallback_allocation: bool = False,
+    strategy: str = "sequential",
+    offload: Union[bool, str, list[str], tuple[str, ...], None] = "auto",
+    return_report: bool = False,
 ):
     """
     Compute a device map for a given model giving priority to GPUs, then offload on CPU and finally offload to disk,
@@ -1326,7 +1811,33 @@ def infer_auto_device_map(
             well as the parameters.
         fallback_allocation (`bool`, *optional*, defaults to `False`):
             When regular allocation fails, try to allocate a module that fits in the size limit using BFS.
+        strategy (`str`, *optional*, defaults to `"sequential"`):
+            The allocation strategy. `"sequential"` keeps the historical behavior and fills devices in order.
+            `"memory_aware"` targets memory usage proportional to each GPU's capacity while accounting for the size of
+            every layer, which balances heterogeneous GPUs without filling them sequentially.
+        offload (`bool`, `str` or `List[str]`, *optional*, defaults to `"auto"`):
+            Offload devices allowed for `"memory_aware"`. Use `"auto"` to use the CPU if it is present in
+            `max_memory` and then disk, `True` to enable CPU then disk, `"cpu"` or `"disk"` to force a device, a list
+            to provide an ordered fallback, or `False` / `"none"` to disable offload.
+        return_report (`bool`, *optional*, defaults to `False`):
+            If `True`, return a `(device_map, report)` tuple where `report` is a [`DeviceMapReport`].
     """
+    strategy = _normalize_allocation_strategy(strategy)
+    if strategy == "memory_aware":
+        device_map, report = _infer_memory_aware_device_map(
+            model,
+            max_memory=max_memory,
+            no_split_module_classes=no_split_module_classes,
+            dtype=dtype,
+            special_dtypes=special_dtypes,
+            clean_result=clean_result,
+            offload=offload,
+            verbose=verbose,
+            offload_buffers=offload_buffers,
+        )
+        if return_report:
+            return device_map, report
+        return device_map
 
     # Initialize the variables
     (
@@ -1580,7 +2091,88 @@ def infer_auto_device_map(
             f"These minimum requirements are specific to this allocation attempt and may vary. Consider increasing "
             f"the available memory for these devices to at least the specified minimum, or adjusting the model config."
         )
+    if return_report:
+        report = get_device_map_report(
+            model,
+            device_map,
+            max_memory=max_memory,
+            dtype=dtype,
+            special_dtypes=special_dtypes,
+            strategy=strategy,
+        )
+        return device_map, report
     return device_map
+
+
+def infer_device_map(
+    model: nn.Module,
+    max_memory: Optional[dict[Union[int, str], Union[int, str]]] = None,
+    no_split_module_classes: Optional[list[str]] = None,
+    dtype: Optional[Union[str, torch.dtype]] = None,
+    special_dtypes: Optional[dict[str, Union[str, torch.device]]] = None,
+    strategy: str = "memory_aware",
+    offload: Union[bool, str, list[str], tuple[str, ...], None] = "auto",
+    verbose: bool = False,
+    clean_result: bool = True,
+    offload_buffers: bool = False,
+    fallback_allocation: bool = False,
+    return_report: bool = False,
+):
+    """
+    Infer a device map using an explicit allocation strategy.
+
+    This is a convenience wrapper around [`infer_auto_device_map`] with a clearer name. The default
+    `"memory_aware"` strategy balances devices using their available memory and the size of each layer, supports CPU
+    and disk offload, and can return a [`DeviceMapReport`].
+    """
+    return infer_auto_device_map(
+        model,
+        max_memory=max_memory,
+        no_split_module_classes=no_split_module_classes,
+        dtype=dtype,
+        special_dtypes=special_dtypes,
+        verbose=verbose,
+        clean_result=clean_result,
+        offload_buffers=offload_buffers,
+        fallback_allocation=fallback_allocation,
+        strategy=strategy,
+        offload=offload,
+        return_report=return_report,
+    )
+
+
+def infer_memory_aware_device_map(
+    model: nn.Module,
+    max_memory: Optional[dict[Union[int, str], Union[int, str]]] = None,
+    no_split_module_classes: Optional[list[str]] = None,
+    dtype: Optional[Union[str, torch.dtype]] = None,
+    special_dtypes: Optional[dict[str, Union[str, torch.device]]] = None,
+    offload: Union[bool, str, list[str], tuple[str, ...], None] = "auto",
+    verbose: bool = False,
+    clean_result: bool = True,
+    offload_buffers: bool = False,
+    fallback_allocation: bool = False,
+    return_report: bool = False,
+):
+    """
+    Infer a device map that balances GPUs by available memory and layer size.
+
+    See [`infer_auto_device_map`] for details on `offload` and `return_report`.
+    """
+    return infer_device_map(
+        model,
+        max_memory=max_memory,
+        no_split_module_classes=no_split_module_classes,
+        dtype=dtype,
+        special_dtypes=special_dtypes,
+        strategy="memory_aware",
+        offload=offload,
+        verbose=verbose,
+        clean_result=clean_result,
+        offload_buffers=offload_buffers,
+        fallback_allocation=fallback_allocation,
+        return_report=return_report,
+    )
 
 
 def check_device_map(model: nn.Module, device_map: dict[str, Union[int, str, torch.device]]):

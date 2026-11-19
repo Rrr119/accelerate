@@ -143,6 +143,7 @@ from .imports import (
     torchao_required,
 )
 from .modeling import (
+    DeviceMapReport,
     align_module_device,
     calculate_maximum_sizes,
     check_device_map,
@@ -154,6 +155,7 @@ from .modeling import (
     find_tied_parameters,
     get_accelerator_free_memory,
     get_balanced_memory,
+    get_device_map_report,
     get_grad_scaler,
     get_max_layer_size,
     get_max_memory,
@@ -161,6 +163,8 @@ from .modeling import (
     has_offloaded_params,
     id_tensor_storage,
     infer_auto_device_map,
+    infer_device_map,
+    infer_memory_aware_device_map,
     is_peft_model,
     load_checkpoint_in_model,
     load_offloaded_weights,

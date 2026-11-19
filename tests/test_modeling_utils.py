@@ -44,10 +44,13 @@ from accelerate.utils.modeling import (
     dtype_byte_size,
     find_tied_parameters,
     get_balanced_memory,
+    get_device_map_report,
     get_module_size_with_ties,
     get_non_persistent_buffers,
     get_state_dict_offloaded_model,
     infer_auto_device_map,
+    infer_device_map,
+    infer_memory_aware_device_map,
     load_checkpoint_in_model,
     load_state_dict,
     named_module_tensors,
@@ -684,6 +687,142 @@ class ModelingUtilsTester(unittest.TestCase):
             model, max_memory={0: 500, 1: 500}, no_split_module_classes=["ModelForTest"]
         )
         assert device_map == {"0": 0, "1": 1, "2": 1}
+
+    def test_infer_device_map_memory_aware_balances_layer_sizes(self):
+        model = nn.Sequential(OrderedDict([(str(i), nn.Linear(10, 10)) for i in range(4)]))
+
+        device_map, report = infer_device_map(
+            model,
+            max_memory={0: 1000, 1: 1500},
+            return_report=True,
+        )
+
+        # Each layer is 440 bytes. The 1000-byte and 1500-byte devices should each receive
+        # two layers rather than filling the first device sequentially.
+        assert list(device_map.values()).count(0) == 2
+        assert list(device_map.values()).count(1) == 2
+        assert report.device_usage[0]["used"] == 880
+        assert report.device_usage[1]["used"] == 880
+        assert report.offloaded_size == 0
+        assert report.strategy == "memory_aware"
+        assert "Device map allocation report" in str(report)
+
+        model = nn.Sequential(OrderedDict([(str(i), nn.Linear(10, 10)) for i in range(6)]))
+        _, report = infer_device_map(
+            model,
+            max_memory={0: 2000, 1: 4000},
+            return_report=True,
+        )
+        # A 1:2 memory ratio should result in a 1:2 split of the layer bytes.
+        assert report.device_usage[0]["used"] * 2 == report.device_usage[1]["used"]
+
+    def test_infer_device_map_memory_aware_offload(self):
+        model = nn.Sequential(OrderedDict([(str(i), nn.Linear(10, 10)) for i in range(6)]))
+        max_memory = {0: 800, 1: 800, "cpu": 880, "disk": 1000}
+
+        device_map, report = infer_memory_aware_device_map(
+            model,
+            max_memory=max_memory,
+            offload=["cpu", "disk"],
+            return_report=True,
+        )
+
+        assert device_map == {"0": 0, "1": 1, "2": "cpu", "3": "cpu", "4": "disk", "5": "disk"}
+        assert report.device_usage["cpu"]["used"] == 880
+        assert report.device_usage["disk"]["used"] == 880
+        assert report.offloaded_size == 1760
+        for device in (0, 1):
+            assert report.device_usage[device]["used"] <= max_memory[device]
+
+    def test_infer_device_map_memory_aware_without_offload_raises(self):
+        model = nn.Sequential(OrderedDict([(str(i), nn.Linear(10, 10)) for i in range(3)]))
+
+        with self.assertRaisesRegex(ValueError, "do not have enough memory"):
+            infer_device_map(model, max_memory={0: 500, 1: 500}, offload=False)
+
+        device_map = infer_device_map(model, max_memory={0: 500, 1: 500}, offload=True)
+        assert any(device in ("cpu", "disk") for device in device_map.values())
+
+    def test_infer_device_map_strategy_alias_and_clean_result(self):
+        model = nn.Sequential(OrderedDict([(str(i), nn.Linear(10, 10)) for i in range(2)]))
+
+        device_map = infer_auto_device_map(model, max_memory={0: 1000}, strategy="memory_balanced")
+        assert device_map == {"": 0}
+
+        device_map = infer_auto_device_map(
+            model,
+            max_memory={0: 1000},
+            strategy="memory_balanced",
+            clean_result=False,
+        )
+        assert device_map == {"0": 0, "1": 0}
+
+    def test_infer_device_map_memory_aware_respects_no_split_modules(self):
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = nn.Linear(10, 10)
+                self.linear2 = nn.Linear(10, 10)
+
+        model = nn.Sequential(OrderedDict([("block1", Block()), ("block2", Block())]))
+
+        device_map = infer_device_map(
+            model,
+            max_memory={0: 600, 1: 600, "cpu": 1000},
+            no_split_module_classes=["Block"],
+            clean_result=False,
+        )
+
+        assert device_map == {"block1": "cpu", "block2": "disk"}
+
+    def test_infer_device_map_memory_aware_buffer_warning(self):
+        model = ModelForTest()
+        model.linear1.register_buffer("test_buffer1", torch.zeros(10, 2))
+        model.batchnorm.register_buffer("test_buffer2", torch.zeros(10, 3))
+        model.linear2.register_buffer("test_buffer3", torch.zeros(10, 3))
+
+        with self.assertWarns(Warning):
+            infer_device_map(model, max_memory={0: 400, "cpu": "1GB"})
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            infer_device_map(model, max_memory={0: 400, "cpu": "1GB"}, offload_buffers=True)
+        assert len(caught) == 0
+
+    def test_get_device_map_report_with_custom_device_map(self):
+        model = ModelForTest()
+        device_map = {"linear1": 0, "batchnorm": "cpu", "linear2": "cpu"}
+
+        report = get_device_map_report(
+            model,
+            device_map,
+            max_memory={0: 200, "cpu": 1000},
+            strategy="custom",
+        )
+
+        assert report.total_size == report.device_usage[0]["used"] + report.device_usage["cpu"]["used"]
+        assert report.device_usage[0]["free"] == 200 - report.device_usage[0]["used"]
+        assert report.device_usage["cpu"]["utilization"] == report.device_usage["cpu"]["used"] / 1000
+        assert report.offloaded_size == report.device_usage["cpu"]["used"]
+        assert report.allocations[0]["module"] == "linear1"
+        assert report.to_dict()["device_map"] == device_map
+        assert dict(report)["offloaded_size"] == report.offloaded_size
+
+    def test_infer_device_map_memory_aware_keeps_tied_parameters_together(self):
+        model = nn.Sequential(
+            OrderedDict([("layer1", nn.Linear(10, 10)), ("layer2", nn.Linear(10, 10)), ("layer3", nn.Linear(10, 10))])
+        )
+        model.layer3.weight = model.layer1.weight
+
+        device_map = infer_device_map(model, max_memory={0: 900, 1: 900})
+        tied_parameters = find_tied_parameters(model)
+
+        for tied_group in tied_parameters:
+            devices = set()
+            for parameter_name in tied_group:
+                module_name = parameter_name.split(".weight")[0]
+                devices.add(device_map.get(module_name))
+            assert len(devices) == 1
 
     def test_infer_auto_device_map_with_tied_weights(self):
         model = nn.Sequential(

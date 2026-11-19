@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from accelerate import DeviceMapReport
 from accelerate.big_modeling import (
     _refuse_recurrent_layers_under_sequence_parallelism,
     cpu_offload,
@@ -865,6 +866,26 @@ class BigModelingTester(unittest.TestCase):
         ):
             assert name == new_name
             torch.testing.assert_close(tensor, new_tensor, msg=new_name)
+
+    def test_load_checkpoint_and_dispatch_memory_aware_report(self):
+        model = ModelForTest()
+
+        with TemporaryDirectory() as tmp_dir:
+            checkpoint = os.path.join(tmp_dir, "pt_model.bin")
+            torch.save(model.state_dict(), checkpoint)
+
+            new_model = ModelForTest()
+            new_model = load_checkpoint_and_dispatch(
+                new_model,
+                checkpoint,
+                device_map="memory_aware",
+                max_memory={"cpu": "1GB"},
+            )
+
+        assert new_model.hf_device_map == {"": "cpu"}
+        assert isinstance(new_model.hf_device_map_report, DeviceMapReport)
+        assert new_model.hf_device_map_report.offloaded_size == new_model.hf_device_map_report.total_size
+        assert new_model.hf_device_map_report.device_usage["cpu"]["used"] == new_model.hf_device_map_report.total_size
 
     @require_non_hpu  # hpu does not support device indexing "hpu:1"
     @require_multi_device
